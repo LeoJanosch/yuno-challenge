@@ -231,14 +231,14 @@ func handleAuthorization(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusPaymentRequired)
 	}
 	
-	json.NewEncoder(w).Encode(response)
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 // handleHealthLive is a shallow health check (liveness probe)
 func handleHealthLive(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
+	_ = json.NewEncoder(w).Encode(map[string]string{
 		"status": "alive",
 		"version": getVersion(),
 	})
@@ -296,13 +296,13 @@ func handleHealthReady(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}
 	
-	json.NewEncoder(w).Encode(response)
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 // handleVersion returns the current version
 func handleVersion(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	_ = json.NewEncoder(w).Encode(map[string]string{
 		"version": getVersion(),
 		"service": "voyager-gateway",
 	})
@@ -313,7 +313,7 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 	atomic.StoreInt64(&totalRequests, 0)
 	atomic.StoreInt64(&successRequests, 0)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	_ = json.NewEncoder(w).Encode(map[string]string{
 		"status": "metrics_reset",
 	})
 }
