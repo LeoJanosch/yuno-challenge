@@ -1,0 +1,355 @@
+# CI/CD Pipeline for Voyager Gateway
+# Implements progressive canary deployment with automated safety gates
+
+name: Deploy Voyager Gateway
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/*'
+    paths:
+      - 'app/**'
+      - 'kubernetes/**'
+      - '.github/workflows/deploy.yaml'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      skip_tests:
+        description: 'Skip tests (emergency deploy only)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/voyager-gateway
+  GO_VERSION: '1.21'
+
+jobs:
+  # Job 1: Build and Test
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.version.outputs.version }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: app/go.sum
+
+      - name: Run tests
+        if: ${{ !inputs.skip_tests }}
+        working-directory: app
+        run: |
+          go test -v -race -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out
+
+      - name: Run linter
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: latest
+          working-directory: app
+
+      - name: Generate version
+        id: version
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "v0.0.0-$(git rev-parse --short HEAD)")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Generated version: $VERSION"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.version }}
+
+  # Job 2: Security Scanning (Stretch Goal)
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Checkov IaC scanner
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infrastructure/
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          soft_fail: true
+
+  # Job 3: Deploy to Dev
+  deploy-dev:
+    name: Deploy to Dev
+    runs-on: ubuntu-latest
+    needs: [build, security-scan]
+    if: github.ref == 'refs/heads/main' || github.event.inputs.environment == 'dev'
+    environment: dev
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region us-east-1 --name dev-voyager-cluster
+
+      - name: Install Argo Rollouts CLI
+        run: |
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Deploy with Argo Rollouts
+        run: |
+          # Update image in rollout
+          kubectl argo rollouts set image voyager-gateway \
+            voyager-gateway=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }} \
+            -n voyager
+
+          # Watch rollout progress
+          kubectl argo rollouts status voyager-gateway -n voyager --timeout 10m
+
+      - name: Verify deployment health
+        run: |
+          # Wait for pods to be ready
+          kubectl wait --for=condition=ready pod -l app=voyager-gateway -n voyager --timeout=120s
+          
+          # Check health endpoint
+          GATEWAY_URL=$(kubectl get svc voyager-gateway -n voyager -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          curl -f "http://${GATEWAY_URL}/health/ready" || exit 1
+
+  # Job 4: Deploy to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build, deploy-dev]
+    if: github.ref == 'refs/heads/main' || github.event.inputs.environment == 'staging'
+    environment: staging
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region us-east-1 --name staging-voyager-cluster
+
+      - name: Install Argo Rollouts CLI
+        run: |
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Deploy with Canary Strategy
+        run: |
+          kubectl argo rollouts set image voyager-gateway \
+            voyager-gateway=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }} \
+            -n voyager
+
+          # Watch rollout with canary analysis
+          kubectl argo rollouts status voyager-gateway -n voyager --timeout 30m
+
+  # Job 5: Deploy to Production
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, deploy-staging]
+    if: github.ref == 'refs/heads/main' || github.event.inputs.environment == 'prod'
+    environment: 
+      name: prod
+      url: https://gateway.yuno.co
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region us-east-1 --name prod-voyager-cluster
+
+      - name: Install Argo Rollouts CLI
+        run: |
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Pre-deployment checks
+        run: |
+          echo "Checking cluster health before deployment..."
+          kubectl get nodes
+          kubectl get pods -n voyager
+          
+          # Check current success rate
+          CURRENT_SUCCESS_RATE=$(kubectl exec -n voyager deploy/voyager-gateway -- wget -qO- http://localhost:8080/health/ready | jq -r '.success_rate')
+          echo "Current success rate: $CURRENT_SUCCESS_RATE%"
+          
+          if (( $(echo "$CURRENT_SUCCESS_RATE < 99.0" | bc -l) )); then
+            echo "Warning: Current success rate is below threshold. Proceeding with caution."
+          fi
+
+      - name: Deploy with Canary Strategy
+        id: deploy
+        run: |
+          # Record deployment start time
+          echo "deployment_start=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+          
+          # Trigger canary rollout
+          kubectl argo rollouts set image voyager-gateway \
+            voyager-gateway=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }} \
+            -n voyager
+
+          # Monitor rollout progress (this will watch canary analysis)
+          kubectl argo rollouts status voyager-gateway -n voyager --timeout 45m
+
+      - name: Post-deployment verification
+        run: |
+          # Verify all pods are running new version
+          NEW_PODS=$(kubectl get pods -n voyager -l app=voyager-gateway -o jsonpath='{.items[*].spec.containers[0].image}' | tr ' ' '\n' | sort -u)
+          echo "Running image versions: $NEW_PODS"
+          
+          # Check health endpoint
+          kubectl exec -n voyager deploy/voyager-gateway -- wget -qO- http://localhost:8080/health/ready
+
+      - name: Notify on success
+        if: success()
+        run: |
+          echo "✅ Production deployment successful!"
+          echo "Version: ${{ needs.build.outputs.version }}"
+          echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }}"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed! Initiating rollback..."
+          kubectl argo rollouts abort voyager-gateway -n voyager
+          kubectl argo rollouts undo voyager-gateway -n voyager
+          
+          # Wait for rollback to complete
+          kubectl argo rollouts status voyager-gateway -n voyager --timeout 10m
+          
+          echo "Rollback completed. Previous version restored."
+
+  # Job 6: Manual Rollback (can be triggered manually)
+  rollback:
+    name: Manual Rollback
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment != ''
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region us-east-1 --name ${{ github.event.inputs.environment }}-voyager-cluster
+
+      - name: Install Argo Rollouts CLI
+        run: |
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Execute rollback
+        run: |
+          echo "Rolling back voyager-gateway in ${{ github.event.inputs.environment }}..."
+          kubectl argo rollouts abort voyager-gateway -n voyager || true
+          kubectl argo rollouts undo voyager-gateway -n voyager
+          kubectl argo rollouts status voyager-gateway -n voyager --timeout 10m
+          echo "Rollback completed successfully!"

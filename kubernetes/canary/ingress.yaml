@@ -1,0 +1,67 @@
+# Ingress configuration for Voyager Gateway
+# Supports canary traffic splitting via Nginx annotations
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: voyager-gateway-ingress
+  namespace: voyager
+  labels:
+    app: voyager-gateway
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    # Rate limiting for protection
+    nginx.ingress.kubernetes.io/limit-rps: "10000"
+    nginx.ingress.kubernetes.io/limit-connections: "1000"
+    # Timeouts
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    # Health check
+    nginx.ingress.kubernetes.io/health-check-path: "/health/ready"
+spec:
+  tls:
+    - hosts:
+        - gateway.yuno.co
+      secretName: voyager-gateway-tls
+  rules:
+    - host: gateway.yuno.co
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: voyager-gateway-stable
+                port:
+                  number: 80
+---
+# Canary Ingress - automatically managed by Argo Rollouts
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: voyager-gateway-ingress-canary
+  namespace: voyager
+  labels:
+    app: voyager-gateway
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "0"
+spec:
+  tls:
+    - hosts:
+        - gateway.yuno.co
+      secretName: voyager-gateway-tls
+  rules:
+    - host: gateway.yuno.co
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: voyager-gateway-canary
+                port:
+                  number: 80

@@ -1,0 +1,223 @@
+# Prometheus alerting rules for Voyager Gateway
+# Implements SLO-based alerting to catch issues before they impact customers
+
+groups:
+  # SLO Alerts - Fire BEFORE SLO is violated
+  - name: voyager-slo-alerts
+    interval: 30s
+    rules:
+      # Success Rate SLO Warning (burning error budget)
+      - alert: VoyagerSuccessRateSLOWarning
+        expr: |
+          (
+            sum(rate(voyager_authorization_total{status="approved"}[5m]))
+            /
+            sum(rate(voyager_authorization_total[5m]))
+          ) < 0.995
+        for: 2m
+        labels:
+          severity: warning
+          team: platform
+          slo: success-rate
+        annotations:
+          summary: "Voyager Gateway success rate approaching SLO violation"
+          description: "Success rate is {{ $value | humanizePercentage }}, SLO target is 99.9%. Investigate before it breaches."
+          runbook_url: "https://runbooks.yuno.co/voyager-gateway/success-rate"
+          dashboard_url: "https://grafana.yuno.co/d/voyager-gateway"
+
+      # Success Rate SLO Critical (SLO violated)
+      - alert: VoyagerSuccessRateSLOCritical
+        expr: |
+          (
+            sum(rate(voyager_authorization_total{status="approved"}[5m]))
+            /
+            sum(rate(voyager_authorization_total[5m]))
+          ) < 0.99
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+          slo: success-rate
+          pagerduty: trigger
+        annotations:
+          summary: "🚨 Voyager Gateway SLO VIOLATED - Success Rate Critical"
+          description: "Success rate is {{ $value | humanizePercentage }}, below 99% SLO. Immediate action required!"
+          runbook_url: "https://runbooks.yuno.co/voyager-gateway/success-rate-critical"
+
+      # P99 Latency SLO Warning
+      - alert: VoyagerLatencyP99Warning
+        expr: |
+          histogram_quantile(0.99, 
+            sum(rate(voyager_authorization_duration_seconds_bucket[5m])) by (le)
+          ) > 0.4
+        for: 3m
+        labels:
+          severity: warning
+          team: platform
+          slo: latency
+        annotations:
+          summary: "Voyager Gateway P99 latency approaching SLO threshold"
+          description: "P99 latency is {{ $value | humanizeDuration }}, SLO target is 500ms"
+          runbook_url: "https://runbooks.yuno.co/voyager-gateway/latency"
+
+      # P99 Latency SLO Critical
+      - alert: VoyagerLatencyP99Critical
+        expr: |
+          histogram_quantile(0.99, 
+            sum(rate(voyager_authorization_duration_seconds_bucket[5m])) by (le)
+          ) > 0.5
+        for: 2m
+        labels:
+          severity: critical
+          team: platform
+          slo: latency
+          pagerduty: trigger
+        annotations:
+          summary: "🚨 Voyager Gateway P99 Latency SLO VIOLATED"
+          description: "P99 latency is {{ $value | humanizeDuration }}, exceeding 500ms SLO"
+
+  # Infrastructure Alerts
+  - name: voyager-infrastructure-alerts
+    rules:
+      # High CPU Usage
+      - alert: VoyagerHighCPU
+        expr: |
+          avg(rate(container_cpu_usage_seconds_total{pod=~"voyager-gateway.*"}[5m])) 
+          / 
+          avg(kube_pod_container_resource_limits{pod=~"voyager-gateway.*", resource="cpu"}) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Voyager Gateway high CPU usage"
+          description: "CPU usage is {{ $value | humanizePercentage }}, consider scaling"
+
+      # High Memory Usage
+      - alert: VoyagerHighMemory
+        expr: |
+          avg(container_memory_working_set_bytes{pod=~"voyager-gateway.*"}) 
+          / 
+          avg(kube_pod_container_resource_limits{pod=~"voyager-gateway.*", resource="memory"}) > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Voyager Gateway high memory usage"
+          description: "Memory usage is {{ $value | humanizePercentage }}"
+
+      # Pod restart detected
+      - alert: VoyagerPodRestarting
+        expr: increase(kube_pod_container_status_restarts_total{pod=~"voyager-gateway.*"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Voyager Gateway pod restarting"
+          description: "Pod {{ $labels.pod }} has restarted {{ $value }} times in the last 15 minutes"
+
+      # No healthy pods
+      - alert: VoyagerNoHealthyPods
+        expr: |
+          sum(kube_pod_status_ready{pod=~"voyager-gateway.*", condition="true"}) == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+          pagerduty: trigger
+        annotations:
+          summary: "🚨 No healthy Voyager Gateway pods!"
+          description: "All Voyager Gateway pods are unhealthy. Service is DOWN."
+
+  # Processor Health Alerts
+  - name: voyager-processor-alerts
+    rules:
+      # Processor timeout spike
+      - alert: VoyagerProcessorTimeouts
+        expr: |
+          sum(rate(voyager_authorization_total{status="declined", processor=~".+"}[5m])) by (processor)
+          /
+          sum(rate(voyager_authorization_total{processor=~".+"}[5m])) by (processor) > 0.05
+        for: 3m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "High timeout rate for {{ $labels.processor }}"
+          description: "Processor {{ $labels.processor }} has {{ $value | humanizePercentage }} timeout rate"
+
+      # Processor completely down
+      - alert: VoyagerProcessorDown
+        expr: |
+          sum(rate(voyager_authorization_total{processor=~".+"}[5m])) by (processor) == 0
+          and
+          sum(rate(voyager_authorization_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Processor {{ $labels.processor }} appears down"
+          description: "No traffic to {{ $labels.processor }} in the last 5 minutes while other processors are active"
+
+  # Deployment Alerts
+  - name: voyager-deployment-alerts
+    rules:
+      # Canary rollout stuck
+      - alert: VoyagerCanaryStuck
+        expr: |
+          sum(kube_pod_labels{label_rollouts_pod_template_hash!="", pod=~"voyager-gateway.*"}) by (label_rollouts_pod_template_hash) > 0
+          and
+          changes(kube_pod_labels{label_rollouts_pod_template_hash!="", pod=~"voyager-gateway.*"}[30m]) == 0
+        for: 30m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Voyager Gateway canary deployment appears stuck"
+          description: "Canary deployment has not progressed in 30 minutes"
+
+      # Rollout aborted
+      - alert: VoyagerRolloutAborted
+        expr: |
+          kube_rollout_status_phase{phase="Degraded", rollout="voyager-gateway"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "🚨 Voyager Gateway rollout ABORTED"
+          description: "The canary deployment was aborted due to failed health checks"
+
+  # Traffic Anomaly Detection
+  - name: voyager-traffic-alerts
+    rules:
+      # Traffic drop (potential issue or outage)
+      - alert: VoyagerTrafficDrop
+        expr: |
+          sum(rate(voyager_authorization_total[5m])) 
+          < 
+          sum(rate(voyager_authorization_total[1h] offset 5m)) * 0.5
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Voyager Gateway traffic dropped significantly"
+          description: "Current traffic is less than 50% of normal. Possible upstream issue."
+
+      # Traffic spike (Black Friday preparation)
+      - alert: VoyagerTrafficSpike
+        expr: |
+          sum(rate(voyager_authorization_total[5m])) 
+          > 
+          sum(rate(voyager_authorization_total[1h] offset 5m)) * 2
+        for: 5m
+        labels:
+          severity: info
+          team: platform
+        annotations:
+          summary: "Voyager Gateway traffic spike detected"
+          description: "Traffic is 2x normal levels. Ensure autoscaling is working."

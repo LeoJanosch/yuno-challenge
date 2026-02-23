@@ -1,0 +1,70 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+voyager-gateway
+
+# Go
+*.test
+*.out
+coverage.out
+go.sum
+
+# Terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform/
+.terraform.lock.hcl
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Secrets (never commit these)
+secrets.tfvars
+*.pem
+*.key
+.env
+.env.*
+credentials.json
+
+# Docker
+.docker/
+
+# Kubernetes
+kubeconfig
+*.kubeconfig
+
+# Load testing results
+load-test-results.json
+*.har
+
+# Logs
+*.log
+logs/
+
+# Build artifacts
+dist/
+build/
+bin/
+
+# Node (if any)
+node_modules/
+
+# Python (if any)
+__pycache__/
+*.py[cod]
+venv/
+.venv/

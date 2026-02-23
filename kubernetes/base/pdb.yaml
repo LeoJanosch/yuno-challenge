@@ -1,0 +1,13 @@
+# Pod Disruption Budget - ensures minimum availability during deployments
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: voyager-gateway-pdb
+  namespace: voyager
+  labels:
+    app: voyager-gateway
+spec:
+  minAvailable: 80%
+  selector:
+    matchLabels:
+      app: voyager-gateway

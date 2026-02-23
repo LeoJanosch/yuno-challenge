@@ -1,0 +1,94 @@
+version: '3.8'
+
+services:
+  # Voyager Gateway - Main payment authorization service
+  voyager-gateway:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - APP_VERSION=1.0.0
+      - FAILURE_RATE=0.02
+      - BASE_LATENCY_MS=50
+      - MIN_SUCCESS_RATE=95.0
+      - SKIP_SECRET_CHECK=true
+      # Mock processor credentials (in production, these come from secrets manager)
+      - STRIPE_API_KEY=${STRIPE_API_KEY:-sk_test_mock_stripe_key}
+      - ADYEN_API_KEY=${ADYEN_API_KEY:-adyen_test_mock_key}
+      - MERCADOPAGO_API_KEY=${MERCADOPAGO_API_KEY:-mp_test_mock_key}
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - voyager-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./kubernetes/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./kubernetes/monitoring/prometheus-rules.yml:/etc/prometheus/rules.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    networks:
+      - voyager-network
+    depends_on:
+      - voyager-gateway
+
+  # Grafana for dashboards
+  grafana:
+    image: grafana/grafana:10.2.2
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./kubernetes/monitoring/grafana-provisioning:/etc/grafana/provisioning
+      - grafana-data:/var/lib/grafana
+    networks:
+      - voyager-network
+    depends_on:
+      - prometheus
+
+  # Load testing with k6 (optional - for stretch goal)
+  k6:
+    image: grafana/k6:0.48.0
+    volumes:
+      - ./load-testing:/scripts
+    networks:
+      - voyager-network
+    profiles:
+      - load-test
+    entrypoint: ["k6", "run", "/scripts/load-test.js"]
+    depends_on:
+      - voyager-gateway
+
+networks:
+  voyager-network:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+  grafana-data:

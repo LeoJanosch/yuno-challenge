@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: voyager-gateway-config
+  namespace: voyager
+  labels:
+    app: voyager-gateway
+data:
+  # Application configuration
+  PORT: "8080"
+  BASE_LATENCY_MS: "50"
+  MIN_SUCCESS_RATE: "95.0"
+  SKIP_SECRET_CHECK: "false"
+  
+  # Logging configuration
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+  
+  # Health check configuration
+  HEALTH_CHECK_INTERVAL: "10s"
+  READINESS_THRESHOLD: "95.0"

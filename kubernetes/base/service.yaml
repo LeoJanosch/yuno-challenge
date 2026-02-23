@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: voyager-gateway
+  namespace: voyager
+  labels:
+    app: voyager-gateway
+    app.kubernetes.io/name: voyager-gateway
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    app: voyager-gateway
+---
+# Canary service for traffic splitting
+apiVersion: v1
+kind: Service
+metadata:
+  name: voyager-gateway-canary
+  namespace: voyager
+  labels:
+    app: voyager-gateway
+    app.kubernetes.io/name: voyager-gateway-canary
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    app: voyager-gateway
+---
+# Stable service for production traffic
+apiVersion: v1
+kind: Service
+metadata:
+  name: voyager-gateway-stable
+  namespace: voyager
+  labels:
+    app: voyager-gateway
+    app.kubernetes.io/name: voyager-gateway-stable
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    app: voyager-gateway

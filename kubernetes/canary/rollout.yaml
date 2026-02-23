@@ -1,0 +1,211 @@
+# Argo Rollouts configuration for Canary deployment
+# This is the core of our progressive deployment strategy
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: voyager-gateway
+  namespace: voyager
+  labels:
+    app: voyager-gateway
+    app.kubernetes.io/name: voyager-gateway
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: 10
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: voyager-gateway
+  template:
+    metadata:
+      labels:
+        app: voyager-gateway
+        app.kubernetes.io/name: voyager-gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: voyager-gateway
+      terminationGracePeriodSeconds: 30
+      
+      containers:
+        - name: voyager-gateway
+          image: voyager-gateway:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          
+          envFrom:
+            - configMapRef:
+                name: voyager-gateway-config
+            - secretRef:
+                name: voyager-processor-credentials
+          
+          env:
+            - name: APP_VERSION
+              value: "1.0.0"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          
+          # Liveness probe - shallow health check
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          
+          # Readiness probe - deep health check
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+          
+          # Startup probe - for slow-starting containers
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - voyager-gateway
+                topologyKey: topology.kubernetes.io/zone
+      
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: voyager-gateway
+  
+  # Canary deployment strategy with automated analysis
+  strategy:
+    canary:
+      # Traffic routing configuration
+      canaryService: voyager-gateway-canary
+      stableService: voyager-gateway-stable
+      
+      # Traffic management with Nginx Ingress
+      trafficRouting:
+        nginx:
+          stableIngress: voyager-gateway-ingress
+          annotationPrefix: nginx.ingress.kubernetes.io
+      
+      # Progressive traffic steps with analysis
+      steps:
+        # Step 1: 5% traffic to canary
+        - setWeight: 5
+        - pause: { duration: 2m }
+        - analysis:
+            templates:
+              - templateName: voyager-success-rate
+              - templateName: voyager-latency
+            args:
+              - name: service-name
+                value: voyager-gateway-canary
+        
+        # Step 2: 10% traffic
+        - setWeight: 10
+        - pause: { duration: 2m }
+        - analysis:
+            templates:
+              - templateName: voyager-success-rate
+              - templateName: voyager-latency
+            args:
+              - name: service-name
+                value: voyager-gateway-canary
+        
+        # Step 3: 25% traffic
+        - setWeight: 25
+        - pause: { duration: 3m }
+        - analysis:
+            templates:
+              - templateName: voyager-success-rate
+              - templateName: voyager-latency
+            args:
+              - name: service-name
+                value: voyager-gateway-canary
+        
+        # Step 4: 50% traffic
+        - setWeight: 50
+        - pause: { duration: 5m }
+        - analysis:
+            templates:
+              - templateName: voyager-success-rate
+              - templateName: voyager-latency
+            args:
+              - name: service-name
+                value: voyager-gateway-canary
+        
+        # Step 5: 75% traffic
+        - setWeight: 75
+        - pause: { duration: 5m }
+        - analysis:
+            templates:
+              - templateName: voyager-success-rate
+              - templateName: voyager-latency
+            args:
+              - name: service-name
+                value: voyager-gateway-canary
+        
+        # Step 6: 100% traffic (full promotion)
+        - setWeight: 100
+        - pause: { duration: 2m }
+      
+      # Rollback configuration
+      maxSurge: "25%"
+      maxUnavailable: 0
+      
+      # Anti-affinity for canary pods
+      antiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          weight: 100
+      
+      # Abort rollout on analysis failure
+      abortScaleDownDelaySeconds: 30

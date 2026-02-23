@@ -1,0 +1,160 @@
+# Analysis Templates for Canary Deployments
+# These define the health signals that determine rollout success/failure
+
+---
+# Success Rate Analysis - Core SLO metric
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: voyager-success-rate
+  namespace: voyager
+spec:
+  args:
+    - name: service-name
+  metrics:
+    - name: success-rate
+      # Check every 30 seconds for 2 minutes
+      interval: 30s
+      count: 4
+      # SLO: 99.9% success rate minimum, fail if below 98%
+      successCondition: result[0] >= 0.99
+      failureCondition: result[0] < 0.98
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            sum(rate(voyager_authorization_total{status="approved", kubernetes_pod_name=~"{{args.service-name}}.*"}[2m])) 
+            / 
+            sum(rate(voyager_authorization_total{kubernetes_pod_name=~"{{args.service-name}}.*"}[2m]))
+
+---
+# P99 Latency Analysis - Performance SLO
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: voyager-latency
+  namespace: voyager
+spec:
+  args:
+    - name: service-name
+  metrics:
+    - name: p99-latency
+      interval: 30s
+      count: 4
+      # SLO: P99 latency must be under 500ms (0.5 seconds)
+      successCondition: result[0] < 0.5
+      failureCondition: result[0] >= 0.8
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            histogram_quantile(0.99, 
+              sum(rate(voyager_authorization_duration_seconds_bucket{kubernetes_pod_name=~"{{args.service-name}}.*"}[2m])) 
+              by (le)
+            )
+
+---
+# Error Rate Analysis - Catch increases in specific error types
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: voyager-error-rate
+  namespace: voyager
+spec:
+  args:
+    - name: service-name
+  metrics:
+    - name: error-rate
+      interval: 30s
+      count: 4
+      # Fail if error rate exceeds 5%
+      successCondition: result[0] < 0.05
+      failureCondition: result[0] >= 0.1
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            sum(rate(voyager_authorization_total{status="declined", kubernetes_pod_name=~"{{args.service-name}}.*"}[2m])) 
+            / 
+            sum(rate(voyager_authorization_total{kubernetes_pod_name=~"{{args.service-name}}.*"}[2m]))
+
+---
+# Processor Health Analysis - Check if processors are responding
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: voyager-processor-health
+  namespace: voyager
+spec:
+  args:
+    - name: service-name
+  metrics:
+    - name: processor-timeout-rate
+      interval: 30s
+      count: 4
+      # Fail if processor timeouts exceed 1%
+      successCondition: result[0] < 0.01
+      failureCondition: result[0] >= 0.05
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            sum(rate(voyager_authorization_total{decline_reason="processor_timeout", kubernetes_pod_name=~"{{args.service-name}}.*"}[2m])) 
+            / 
+            sum(rate(voyager_authorization_total{kubernetes_pod_name=~"{{args.service-name}}.*"}[2m]))
+
+---
+# Combined Analysis for comprehensive health checking
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: voyager-comprehensive
+  namespace: voyager
+spec:
+  args:
+    - name: service-name
+  metrics:
+    - name: success-rate
+      interval: 30s
+      count: 4
+      successCondition: result[0] >= 0.99
+      failureCondition: result[0] < 0.98
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            sum(rate(voyager_authorization_total{status="approved", kubernetes_pod_name=~"{{args.service-name}}.*"}[2m])) 
+            / 
+            sum(rate(voyager_authorization_total{kubernetes_pod_name=~"{{args.service-name}}.*"}[2m]))
+    
+    - name: p99-latency
+      interval: 30s
+      count: 4
+      successCondition: result[0] < 0.5
+      failureCondition: result[0] >= 0.8
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            histogram_quantile(0.99, 
+              sum(rate(voyager_authorization_duration_seconds_bucket{kubernetes_pod_name=~"{{args.service-name}}.*"}[2m])) 
+              by (le)
+            )
+    
+    - name: active-requests
+      interval: 30s
+      count: 2
+      # Ensure service is receiving traffic
+      successCondition: result[0] > 0
+      failureLimit: 3
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            sum(voyager_active_requests{kubernetes_pod_name=~"{{args.service-name}}.*"})
